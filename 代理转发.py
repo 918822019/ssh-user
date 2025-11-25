@@ -152,6 +152,7 @@ class SSHProxyWithRSA:
                     self.logger = logger_ref
                     self.auth_success = False
                     self.username = None
+                    self.client_key = None  # ✓ 保存客户端公钥，用于真实SSH认证
 
                 def check_auth_publickey(self, username: str, key: paramiko.RSAKey) -> int:
                     """检查公钥认证"""
@@ -163,6 +164,7 @@ class SSHProxyWithRSA:
                     for auth_key in self.authorized_keys:
                         if key.get_fingerprint() == auth_key.get_fingerprint():
                             self.auth_success = True
+                            self.client_key = key  # ✓ 保存客户端公钥
                             logger.info(f"✓ [认证成功] 用户 '{username}' RSA公钥匹配，已授权")
                             return paramiko.AUTH_SUCCESSFUL
                     
@@ -215,27 +217,27 @@ class SSHProxyWithRSA:
             for attempt in range(SSH_HANDSHAKE_TIMEOUT * 10):  # 最多5秒，每100ms检查一次
                 if transport.is_authenticated():
                     logger.info(f"✓ 用户 '{server.username}' 认证通过，Transport已建立")
-                    return True, transport
+                    return True, transport, server  # ✓ 返回server对象
                 
                 if not transport.is_active():
                     logger.warning("Transport已断开，认证失败")
-                    return False, transport
+                    return False, transport, None
                 
                 time.sleep(0.1)
             
             # 超时
             logger.warning(f"✗ 认证超时（{SSH_HANDSHAKE_TIMEOUT}秒）")
-            return False, transport
+            return False, transport, None
 
         except SSHException as e:
             logger.error(f"SSH协议错误：{e}")
-            return False, transport
+            return False, transport, None
         except socket.timeout:
             logger.warning(f"Socket超时（{SSH_HANDSHAKE_TIMEOUT}秒）")
-            return False, transport
+            return False, transport, None
         except Exception as e:
             logger.error(f"认证过程异常：{type(e).__name__}: {e}")
-            return False, transport
+            return False, transport, None
 
     def _send_404_response(self, sock: socket.socket) -> bool:
         """
@@ -371,12 +373,14 @@ class SSHProxyWithRSA:
             
             # ========== 第2步：执行RSA认证 ==========
             logger.info("[认证] 启动RSA认证...")
-            auth_success, transport = self._verify_rsa_auth(client_sock)
+            auth_result = self._verify_rsa_auth(client_sock)
             
-            if not auth_success or not transport:
+            if not auth_result or not auth_result[0] or not auth_result[1]:
                 logger.warning(f"[认证] ✗ 客户端 {client_ip} RSA认证失败")
                 self._send_404_response(client_sock)
                 return
+            
+            auth_success, transport, server = auth_result  # ✓ 获取server对象
             
             logger.info(f"✓ Transport已建立，开始监听客户端通道...")
             
@@ -403,6 +407,7 @@ class SSHProxyWithRSA:
                         # ✓ 改进：使用 Paramiko Transport 连接真实SSH，而非原始socket
                         real_ssh_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         real_ssh_socket.connect((REAL_SSH_HOST, REAL_SSH_PORT))
+                        real_ssh_socket.settimeout(None)  # 无超时以支持长连接
                         
                         # 与真实SSH建立Paramiko Transport
                         real_transport = paramiko.Transport(real_ssh_socket)
@@ -411,18 +416,22 @@ class SSHProxyWithRSA:
                         # 等待协议交换完成
                         time.sleep(0.5)
                         
-                        # 与真实SSH服务器进行认证（使用相同的用户名和密钥）
-                        username = client_channel.get_name()  # 获取客户端的用户名
-                        pkey = self.host_key  # 使用服务器自己的密钥作为客户端密钥
+                        # ✓ 用客户端的公钥去认证真实SSH
+                        # 这样实现了"代理转发"：客户端的凭证直接转发给真实SSH
+                        username = server.username  # 获取客户端认证时使用的用户名
+                        client_key = server.client_key  # 获取客户端的公钥
                         
-                        try:
-                            real_transport.auth_publickey(username, pkey)
-                            if not real_transport.is_authenticated():
-                                logger.warning(f"[连接] 真实SSH认证失败，尝试密码认证...")
-                                # 备选：使用空密码
-                                real_transport.auth_password(username, "")
-                        except Exception as auth_err:
-                            logger.warning(f"[连接] 真实SSH认证异常：{auth_err}")
+                        if client_key:
+                            try:
+                                real_transport.auth_publickey(username, client_key)
+                                if real_transport.is_authenticated():
+                                    logger.info(f"[连接] ✓ 已用客户端公钥认证到真实SSH")
+                                else:
+                                    logger.warning(f"[连接] 真实SSH公钥认证失败")
+                            except Exception as auth_err:
+                                logger.warning(f"[连接] 真实SSH认证异常：{auth_err}")
+                        else:
+                            logger.warning(f"[连接] 无可用的客户端公钥")
                         
                         # 获取真实SSH的远程通道
                         real_channel = real_transport.open_session()
