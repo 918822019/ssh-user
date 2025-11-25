@@ -278,6 +278,7 @@ class SSHProxyWithRSA:
                 """客户端→真实SSH服务器"""
                 try:
                     while True:
+                        # ✓ 使用 recv 而非 sendall
                         data = client_channel.recv(4096)
                         if not data:
                             logger.debug("客户端通道已关闭")
@@ -306,7 +307,13 @@ class SSHProxyWithRSA:
                             break
                         
                         try:
-                            client_channel.sendall(data)
+                            # ✓ 使用 send 而非 sendall（Paramiko Channel用send）
+                            sent = 0
+                            while sent < len(data):
+                                n = client_channel.send(data[sent:])
+                                if n == 0:
+                                    raise Exception("Channel send returned 0")
+                                sent += n
                             logger.debug(f"← 服务器→客户端转发 {len(data)} 字节")
                         except Exception as e:
                             logger.error(f"发送到客户端失败：{type(e).__name__}: {e}")
