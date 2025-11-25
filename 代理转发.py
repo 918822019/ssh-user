@@ -408,6 +408,22 @@ class SSHProxyWithRSA:
                         real_transport = paramiko.Transport(real_ssh_socket)
                         real_transport.start_client()
                         
+                        # 等待协议交换完成
+                        time.sleep(0.5)
+                        
+                        # 与真实SSH服务器进行认证（使用相同的用户名和密钥）
+                        username = client_channel.get_name()  # 获取客户端的用户名
+                        pkey = self.host_key  # 使用服务器自己的密钥作为客户端密钥
+                        
+                        try:
+                            real_transport.auth_publickey(username, pkey)
+                            if not real_transport.is_authenticated():
+                                logger.warning(f"[连接] 真实SSH认证失败，尝试密码认证...")
+                                # 备选：使用空密码
+                                real_transport.auth_password(username, "")
+                        except Exception as auth_err:
+                            logger.warning(f"[连接] 真实SSH认证异常：{auth_err}")
+                        
                         # 获取真实SSH的远程通道
                         real_channel = real_transport.open_session()
                         if real_channel:
