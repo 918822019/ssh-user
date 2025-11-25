@@ -267,63 +267,52 @@ class SSHProxyWithRSA:
             except Exception as e:
                 logger.error(f"关闭Socket失败：{type(e).__name__}: {e}")
 
-    def forward_traffic(self, client_channel: paramiko.Channel, server_socket: socket.socket):
+    def forward_traffic(self, client_channel: paramiko.Channel, server_channel: paramiko.Channel):
         """
-        双向转发SSH通道与真实SSH服务器之间的流量
+        双向转发SSH通道之间的流量
         
-        使用两个线程分别处理双向数据转发
+        客户端通道 ←→ 代理 ←→ 真实SSH通道
         """
         try:
             def forward_client_to_server():
                 """客户端→真实SSH服务器"""
                 try:
                     while True:
-                        # ✓ 使用 recv 而非 sendall
-                        data = client_channel.recv(4096)
-                        if not data:
-                            logger.debug("客户端通道已关闭")
-                            break
                         try:
-                            server_socket.sendall(data)
+                            data = client_channel.recv(4096)
+                            if not data:
+                                logger.debug("客户端通道已关闭")
+                                break
+                            
+                            server_channel.send(data)
                             logger.debug(f"→ 客户端→服务器转发 {len(data)} 字节")
                         except Exception as e:
-                            logger.error(f"发送到服务器失败：{type(e).__name__}: {e}")
+                            logger.error(f"客户端→服务器转发异常：{type(e).__name__}: {e}")
                             break
                 except Exception as e:
-                    logger.error(f"客户端→服务器转发异常：{type(e).__name__}: {e}")
+                    logger.error(f"客户端转发线程异常：{type(e).__name__}: {e}")
 
             def forward_server_to_client():
                 """真实SSH服务器→客户端"""
                 try:
                     while True:
                         try:
-                            data = server_socket.recv(4096)
-                        except Exception as e:
-                            logger.error(f"从服务器接收失败：{type(e).__name__}: {e}")
-                            break
-                        
-                        if not data:
-                            logger.debug("服务器连接已关闭")
-                            break
-                        
-                        try:
-                            # ✓ 使用 send 而非 sendall（Paramiko Channel用send）
-                            sent = 0
-                            while sent < len(data):
-                                n = client_channel.send(data[sent:])
-                                if n == 0:
-                                    raise Exception("Channel send returned 0")
-                                sent += n
+                            data = server_channel.recv(4096)
+                            if not data:
+                                logger.debug("服务器通道已关闭")
+                                break
+                            
+                            client_channel.send(data)
                             logger.debug(f"← 服务器→客户端转发 {len(data)} 字节")
                         except Exception as e:
-                            logger.error(f"发送到客户端失败：{type(e).__name__}: {e}")
+                            logger.error(f"服务器→客户端转发异常：{type(e).__name__}: {e}")
                             break
                 except Exception as e:
-                    logger.error(f"服务器→客户端转发异常：{type(e).__name__}: {e}")
+                    logger.error(f"服务器转发线程异常：{type(e).__name__}: {e}")
 
-            # 创建两个转发线程（不使用daemon，等待正常完成）
-            t1 = threading.Thread(target=forward_client_to_server)
-            t2 = threading.Thread(target=forward_server_to_client)
+            # 创建两个转发线程
+            t1 = threading.Thread(target=forward_client_to_server, name="c2s")
+            t2 = threading.Thread(target=forward_server_to_client, name="s2c")
             t1.start()
             t2.start()
             
@@ -336,7 +325,6 @@ class SSHProxyWithRSA:
         except Exception as e:
             logger.error(f"流量转发异常：{type(e).__name__}: {e}")
         finally:
-            # 只在所有转发结束后关闭资源
             try:
                 if client_channel and client_channel.active:
                     client_channel.close()
@@ -345,11 +333,11 @@ class SSHProxyWithRSA:
                 logger.debug(f"关闭客户端通道失败：{type(e).__name__}: {e}")
             
             try:
-                if server_socket and server_socket.fileno() != -1:
-                    server_socket.close()
-                    logger.debug("服务器Socket已关闭")
+                if server_channel and server_channel.active:
+                    server_channel.close()
+                    logger.debug("服务器通道已关闭")
             except Exception as e:
-                logger.debug(f"关闭服务器Socket失败：{type(e).__name__}: {e}")
+                logger.debug(f"关闭服务器通道失败：{type(e).__name__}: {e}")
 
     def handle_client_connection(self, client_sock: socket.socket, client_addr: Tuple[str, int]):
         """
@@ -411,30 +399,32 @@ class SSHProxyWithRSA:
                     # ========== 第4步：连接真实SSH服务器 ==========
                     try:
                         logger.info(f"[连接] 连接真实SSH服务：{REAL_SSH_HOST}:{REAL_SSH_PORT}...")
-                        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        server_socket.settimeout(SOCKET_TIMEOUT)
-                        server_socket.connect((REAL_SSH_HOST, REAL_SSH_PORT))
-                        server_socket.settimeout(None)  # ✓ 连接成功后移除超时，允许持久连接
-                        logger.info(f"[连接] ✓ 已连接到真实SSH服务")
                         
-                        # ========== 第5步：双向转发流量 ==========
-                        logger.info(f"[转发] 启动该通道的流量转发...")
-                        self.forward_traffic(client_channel, server_socket)
-                        logger.info(f"[转发] ✓ 该通道转发完成")
-                    
-                    except ConnectionRefusedError:
-                        logger.error(f"[连接] ✗ 无法连接到真实SSH服务 {REAL_SSH_HOST}:{REAL_SSH_PORT}")
-                        try:
-                            client_channel.close()
-                        except:
-                            pass
+                        # ✓ 改进：使用 Paramiko Transport 连接真实SSH，而非原始socket
+                        real_ssh_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        real_ssh_socket.connect((REAL_SSH_HOST, REAL_SSH_PORT))
+                        
+                        # 与真实SSH建立Paramiko Transport
+                        real_transport = paramiko.Transport(real_ssh_socket)
+                        real_transport.start_client()
+                        
+                        # 获取真实SSH的远程通道
+                        real_channel = real_transport.open_session()
+                        if real_channel:
+                            real_channel.invoke_shell()
+                            logger.info(f"[连接] ✓ 已连接到真实SSH服务")
+                            
+                            # ========== 第5步：双向转发流量 ==========
+                            logger.info(f"[转发] 启动该通道的流量转发...")
+                            self.forward_traffic(client_channel, real_channel)
+                            logger.info(f"[转发] ✓ 该通道转发完成")
+                        else:
+                            logger.error(f"[连接] ✗ 无法打开真实SSH通道")
+                            self._send_404_response(client_sock)
                     
                     except Exception as e:
-                        logger.error(f"[通道转发] 异常（通道 {client_channel.get_id()}）：{type(e).__name__}: {e}")
-                        try:
-                            client_channel.close()
-                        except:
-                            pass
+                        logger.error(f"[连接] ✗ 连接真实SSH服务失败：{type(e).__name__}: {e}")
+                        self._send_404_response(client_sock)
                 
                 except Exception as e:
                     logger.warning(f"[通道接收] 异常：{type(e).__name__}: {e}")
