@@ -16,7 +16,7 @@ REAL_SSH_HOST = "localhost"
 REAL_SSH_PORT = 2222
 
 # ==================== 超时配置（统一定义）====================
-SOCKET_TIMEOUT = 10        # Socket操作超时
+SOCKET_TIMEOUT = 100        # Socket操作超时
 SSH_HANDSHAKE_TIMEOUT = 5  # SSH握手超时（包括密钥交换和认证）
 CHANNEL_ACCEPT_TIMEOUT = 10  # 等待通道超时
 
@@ -282,39 +282,41 @@ class SSHProxyWithRSA:
                         if not data:
                             logger.debug("客户端通道已关闭")
                             break
-                        server_socket.sendall(data)
-                        logger.debug(f"→ 客户端→服务器转发 {len(data)} 字节")
+                        try:
+                            server_socket.sendall(data)
+                            logger.debug(f"→ 客户端→服务器转发 {len(data)} 字节")
+                        except Exception as e:
+                            logger.error(f"发送到服务器失败：{type(e).__name__}: {e}")
+                            break
                 except Exception as e:
                     logger.error(f"客户端→服务器转发异常：{type(e).__name__}: {e}")
-                finally:
-                    try:
-                        if client_channel and client_channel.active:
-                            client_channel.close()
-                    except Exception as e:
-                        logger.debug(f"关闭客户端通道失败：{type(e).__name__}: {e}")
 
             def forward_server_to_client():
                 """真实SSH服务器→客户端"""
                 try:
                     while True:
-                        data = server_socket.recv(4096)
+                        try:
+                            data = server_socket.recv(4096)
+                        except Exception as e:
+                            logger.error(f"从服务器接收失败：{type(e).__name__}: {e}")
+                            break
+                        
                         if not data:
                             logger.debug("服务器连接已关闭")
                             break
-                        client_channel.sendall(data)
-                        logger.debug(f"← 服务器→客户端转发 {len(data)} 字节")
+                        
+                        try:
+                            client_channel.sendall(data)
+                            logger.debug(f"← 服务器→客户端转发 {len(data)} 字节")
+                        except Exception as e:
+                            logger.error(f"发送到客户端失败：{type(e).__name__}: {e}")
+                            break
                 except Exception as e:
                     logger.error(f"服务器→客户端转发异常：{type(e).__name__}: {e}")
-                finally:
-                    try:
-                        if server_socket and server_socket.fileno() != -1:
-                            server_socket.close()
-                    except Exception as e:
-                        logger.debug(f"关闭服务器Socket失败：{type(e).__name__}: {e}")
 
-            # 创建两个转发线程
-            t1 = threading.Thread(target=forward_client_to_server, daemon=True)
-            t2 = threading.Thread(target=forward_server_to_client, daemon=True)
+            # 创建两个转发线程（不使用daemon，等待正常完成）
+            t1 = threading.Thread(target=forward_client_to_server)
+            t2 = threading.Thread(target=forward_server_to_client)
             t1.start()
             t2.start()
             
@@ -327,6 +329,7 @@ class SSHProxyWithRSA:
         except Exception as e:
             logger.error(f"流量转发异常：{type(e).__name__}: {e}")
         finally:
+            # 只在所有转发结束后关闭资源
             try:
                 if client_channel and client_channel.active:
                     client_channel.close()
@@ -404,6 +407,7 @@ class SSHProxyWithRSA:
                         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         server_socket.settimeout(SOCKET_TIMEOUT)
                         server_socket.connect((REAL_SSH_HOST, REAL_SSH_PORT))
+                        server_socket.settimeout(None)  # ✓ 连接成功后移除超时，允许持久连接
                         logger.info(f"[连接] ✓ 已连接到真实SSH服务")
                         
                         # ========== 第5步：双向转发流量 ==========
