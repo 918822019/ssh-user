@@ -15,6 +15,11 @@ LISTEN_HOST = "0.0.0.0"
 REAL_SSH_HOST = "localhost"
 REAL_SSH_PORT = 2222
 
+# ==================== 超时配置（统一定义）====================
+SOCKET_TIMEOUT = 10        # Socket操作超时
+SSH_HANDSHAKE_TIMEOUT = 5  # SSH握手超时（包括密钥交换和认证）
+CHANNEL_ACCEPT_TIMEOUT = 10  # 等待通道超时
+
 # HTTP 404 响应
 FAKE_HTTP_RESPONSE = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
@@ -137,8 +142,8 @@ class SSHProxyWithRSA:
             # 创建Transport
             transport = paramiko.Transport(client_sock)
             transport.set_keepalive(30)
-            transport.banner_timeout = 10
-            transport.channel_timeout = 15
+            transport.banner_timeout = SSH_HANDSHAKE_TIMEOUT
+            transport.channel_timeout = SSH_HANDSHAKE_TIMEOUT
 
             # 定义SSH服务器接口
             class RSAAuthServer(paramiko.ServerInterface):
@@ -202,24 +207,34 @@ class SSHProxyWithRSA:
             transport.add_server_key(self.server_key)
             transport.start_server(server=server)
             
-            # 等待认证完成
-            channel = transport.accept(15)
+            # ✓ 修复：轮询等待认证完成，而非等待通道
+            # SSH握手完成后，start_server() 会异步处理认证
+            # 不应该调用 transport.accept() 等待通道，那是客户端的操作
+            logger.debug("[认证] 等待SSH握手和认证完成...")
             
-            if server.auth_success and transport.is_authenticated():
-                logger.info(f"✓ 用户 '{server.username}' 认证通过，Transport已建立")
-                return True, transport
-            else:
-                logger.warning(f"✗ 认证未通过")
-                return False, transport
+            for attempt in range(SSH_HANDSHAKE_TIMEOUT * 10):  # 最多5秒，每100ms检查一次
+                if transport.is_authenticated():
+                    logger.info(f"✓ 用户 '{server.username}' 认证通过，Transport已建立")
+                    return True, transport
+                
+                if not transport.is_active():
+                    logger.warning("Transport已断开，认证失败")
+                    return False, transport
+                
+                time.sleep(0.1)
+            
+            # 超时
+            logger.warning(f"✗ 认证超时（{SSH_HANDSHAKE_TIMEOUT}秒）")
+            return False, transport
 
         except SSHException as e:
             logger.error(f"SSH协议错误：{e}")
             return False, transport
         except socket.timeout:
-            logger.warning("认证超时（15秒）")
+            logger.warning(f"Socket超时（{SSH_HANDSHAKE_TIMEOUT}秒）")
             return False, transport
         except Exception as e:
-            logger.error(f"认证过程异常：{e}")
+            logger.error(f"认证过程异常：{type(e).__name__}: {e}")
             return False, transport
 
     def _send_404_response(self, sock: socket.socket) -> bool:
@@ -229,6 +244,7 @@ class SSHProxyWithRSA:
         用于拒绝非SSH请求或认证失败的请求
         """
         try:
+            # ✓ 修复：使用 fileno() 检查socket状态，避免访问私有属性 _closed
             if sock.fileno() == -1:
                 logger.debug("Socket已关闭，无法发送404响应")
                 return False
@@ -238,13 +254,18 @@ class SSHProxyWithRSA:
             logger.info("已发送HTTP 404响应")
             return True
         except OSError as e:
-            logger.error(f"发送404响应失败：{e}")
+            logger.error(f"发送404响应失败：{type(e).__name__}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"发送404响应异常：{type(e).__name__}: {e}")
             return False
         finally:
             try:
-                sock.close()
-            except:
-                pass
+                if sock.fileno() != -1:
+                    sock.close()
+                    logger.debug("Socket已关闭")
+            except Exception as e:
+                logger.error(f"关闭Socket失败：{type(e).__name__}: {e}")
 
     def forward_traffic(self, client_channel: paramiko.Channel, server_socket: socket.socket):
         """
@@ -264,12 +285,13 @@ class SSHProxyWithRSA:
                         server_socket.sendall(data)
                         logger.debug(f"→ 客户端→服务器转发 {len(data)} 字节")
                 except Exception as e:
-                    logger.error(f"客户端→服务器转发异常：{e}")
+                    logger.error(f"客户端→服务器转发异常：{type(e).__name__}: {e}")
                 finally:
                     try:
-                        client_channel.close()
-                    except:
-                        pass
+                        if client_channel and client_channel.active:
+                            client_channel.close()
+                    except Exception as e:
+                        logger.debug(f"关闭客户端通道失败：{type(e).__name__}: {e}")
 
             def forward_server_to_client():
                 """真实SSH服务器→客户端"""
@@ -282,12 +304,13 @@ class SSHProxyWithRSA:
                         client_channel.sendall(data)
                         logger.debug(f"← 服务器→客户端转发 {len(data)} 字节")
                 except Exception as e:
-                    logger.error(f"服务器→客户端转发异常：{e}")
+                    logger.error(f"服务器→客户端转发异常：{type(e).__name__}: {e}")
                 finally:
                     try:
-                        server_socket.close()
-                    except:
-                        pass
+                        if server_socket and server_socket.fileno() != -1:
+                            server_socket.close()
+                    except Exception as e:
+                        logger.debug(f"关闭服务器Socket失败：{type(e).__name__}: {e}")
 
             # 创建两个转发线程
             t1 = threading.Thread(target=forward_client_to_server, daemon=True)
@@ -302,15 +325,21 @@ class SSHProxyWithRSA:
             logger.info("✓ 转发完成，连接关闭")
         
         except Exception as e:
-            logger.error(f"流量转发异常：{e}")
+            logger.error(f"流量转发异常：{type(e).__name__}: {e}")
         finally:
             try:
                 if client_channel and client_channel.active:
                     client_channel.close()
-                if server_socket and not server_socket._closed:
+                    logger.debug("客户端通道已关闭")
+            except Exception as e:
+                logger.debug(f"关闭客户端通道失败：{type(e).__name__}: {e}")
+            
+            try:
+                if server_socket and server_socket.fileno() != -1:
                     server_socket.close()
-            except:
-                pass
+                    logger.debug("服务器Socket已关闭")
+            except Exception as e:
+                logger.debug(f"关闭服务器Socket失败：{type(e).__name__}: {e}")
 
     def handle_client_connection(self, client_sock: socket.socket, client_addr: Tuple[str, int]):
         """
@@ -319,20 +348,17 @@ class SSHProxyWithRSA:
         流程：
         1. 检测初始数据是否为HTTP请求（若是则返回404）
         2. 执行RSA认证
-        3. 连接真实SSH服务器
-        4. 建立通道并转发流量
+        3. 为每个客户端通道连接真实SSH服务器并转发流量
         """
         client_ip, client_port = client_addr
         logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         logger.info(f"[连接] 新客户端连接：{client_ip}:{client_port}")
         
         transport = None
-        client_channel = None
-        server_socket = None
         
         try:
             # 设置socket超时
-            client_sock.settimeout(10)
+            client_sock.settimeout(SOCKET_TIMEOUT)
             
             # ========== 第1步：检测HTTP请求 ==========
             logger.info("[检测] 检测协议类型...")
@@ -354,51 +380,80 @@ class SSHProxyWithRSA:
                 self._send_404_response(client_sock)
                 return
             
-            # ========== 第3步：等待客户端建立通道 ==========
-            logger.info("[通道] 等待客户端建立SSH通道...")
-            client_channel = transport.accept(20)
+            logger.info(f"✓ Transport已建立，开始监听客户端通道...")
             
-            if not client_channel:
-                logger.warning(f"[通道] ✗ 客户端 {client_ip} 未建立通道")
-                return
-            
-            logger.info(f"[通道] ✓ 通道建立成功")
-            
-            # ========== 第4步：连接真实SSH服务器 ==========
-            logger.info(f"[连接] 连接真实SSH服务：{REAL_SSH_HOST}:{REAL_SSH_PORT}...")
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.connect((REAL_SSH_HOST, REAL_SSH_PORT))
-            logger.info(f"[连接] ✓ 已连接到真实SSH服务")
-            
-            # ========== 第5步：双向转发流量 ==========
-            logger.info(f"[转发] 启动流量转发...")
-            self.forward_traffic(client_channel, server_socket)
-            logger.info(f"[转发] ✓ 流量转发完成")
-            
-        except socket.timeout:
-            logger.warning(f"[超时] 连接超时（来自 {client_ip}）")
-            self._send_404_response(client_sock)
+            # ========== 第3步：通道转发循环 ==========
+            # ✓ 修复：认证成功后，进入通道接收循环
+            # 每当客户端建立一个新通道时，我们就连接真实SSH服务并转发
+            while True:
+                logger.debug("[通道] 等待客户端建立新的SSH通道...")
+                
+                try:
+                    # 等待客户端发送通道请求 (SSH_MSG_CHANNEL_OPEN)
+                    client_channel = transport.accept(timeout=CHANNEL_ACCEPT_TIMEOUT)
+                    
+                    if client_channel is None:
+                        logger.debug("[通道] ℹ️  通道接收超时，继续等待...")
+                        continue
+                    
+                    logger.info(f"[通道] ✓ 接收到新通道请求：{client_channel.get_name()}(ID:{client_channel.get_id()})")
+                    
+                    # ========== 第4步：连接真实SSH服务器 ==========
+                    try:
+                        logger.info(f"[连接] 连接真实SSH服务：{REAL_SSH_HOST}:{REAL_SSH_PORT}...")
+                        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        server_socket.settimeout(SOCKET_TIMEOUT)
+                        server_socket.connect((REAL_SSH_HOST, REAL_SSH_PORT))
+                        logger.info(f"[连接] ✓ 已连接到真实SSH服务")
+                        
+                        # ========== 第5步：双向转发流量 ==========
+                        logger.info(f"[转发] 启动该通道的流量转发...")
+                        self.forward_traffic(client_channel, server_socket)
+                        logger.info(f"[转发] ✓ 该通道转发完成")
+                    
+                    except ConnectionRefusedError:
+                        logger.error(f"[连接] ✗ 无法连接到真实SSH服务 {REAL_SSH_HOST}:{REAL_SSH_PORT}")
+                        try:
+                            client_channel.close()
+                        except:
+                            pass
+                    
+                    except Exception as e:
+                        logger.error(f"[通道转发] 异常（通道 {client_channel.get_id()}）：{type(e).__name__}: {e}")
+                        try:
+                            client_channel.close()
+                        except:
+                            pass
+                
+                except Exception as e:
+                    logger.warning(f"[通道接收] 异常：{type(e).__name__}: {e}")
+                    break  # 退出通道循环
         
-        except ConnectionRefusedError:
-            logger.error(f"[连接] ✗ 无法连接到真实SSH服务 {REAL_SSH_HOST}:{REAL_SSH_PORT}")
+        except socket.timeout:
+            logger.warning(f"[超时] Socket操作超时（来自 {client_ip}）")
             self._send_404_response(client_sock)
         
         except Exception as e:
-            logger.error(f"[异常] 处理连接异常 ({client_ip})：{e}")
+            logger.error(f"[异常] 处理连接异常 ({client_ip})：{type(e).__name__}: {e}")
             self._send_404_response(client_sock)
         
         finally:
             # 清理资源
+            logger.debug(f"[清理] 清理连接资源...")
             try:
-                if client_channel and client_channel.active:
-                    client_channel.close()
-                if transport and transport.is_active():
-                    transport.close()
-                if server_socket and not server_socket._closed:
-                    server_socket.close()
-                client_sock.close()
-            except:
-                pass
+                if transport is not None:
+                    if transport.is_active():
+                        transport.close()
+                        logger.debug("[清理] ✓ Transport已关闭")
+            except Exception as e:
+                logger.error(f"[清理] 关闭Transport失败：{type(e).__name__}: {e}")
+            
+            try:
+                if client_sock and client_sock.fileno() != -1:
+                    client_sock.close()
+                    logger.debug("[清理] ✓ 客户端Socket已关闭")
+            except Exception as e:
+                logger.error(f"[清理] 关闭客户端Socket失败：{type(e).__name__}: {e}")
             
             logger.info(f"[断开] 连接关闭：{client_ip}:{client_port}")
             logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
@@ -419,6 +474,9 @@ class SSHProxyWithRSA:
             logger.info(f"目标SSH：{REAL_SSH_HOST}:{REAL_SSH_PORT}")
             logger.info(f"授权客户端数：{len(self.authorized_keys)}")
             logger.info(f"服务器密钥指纹：{self.server_key.get_fingerprint().hex()}")
+            logger.info(f"Socket超时：{SOCKET_TIMEOUT}秒")
+            logger.info(f"SSH握手超时：{SSH_HANDSHAKE_TIMEOUT}秒")
+            logger.info(f"通道等待超时：{CHANNEL_ACCEPT_TIMEOUT}秒")
             logger.info("="*50)
             logger.info("等待客户端连接...\n")
             
@@ -438,17 +496,18 @@ class SSHProxyWithRSA:
                     logger.info("\n接收到中断信号，正在关闭...")
                     break
                 except Exception as e:
-                    logger.error(f"接受连接失败：{e}")
+                    logger.error(f"接受连接失败：{type(e).__name__}: {e}")
         
         except Exception as e:
-            logger.error(f"代理启动失败：{e}")
+            logger.error(f"代理启动失败：{type(e).__name__}: {e}")
         
         finally:
             try:
-                server_sock.close()
-                logger.info("服务器已关闭")
-            except:
-                pass
+                if 'server_sock' in locals() and server_sock.fileno() != -1:
+                    server_sock.close()
+                    logger.info("服务器已关闭")
+            except Exception as e:
+                logger.error(f"关闭服务器失败：{type(e).__name__}: {e}")
 
 
 # ==================== 入口点 ====================
